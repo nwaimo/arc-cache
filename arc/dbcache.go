@@ -3,10 +3,10 @@ package arc
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"hash"
 	"hash/fnv"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,18 +23,18 @@ type QueryResult struct {
 // only the cache entries associated with the affected table.
 type CachedDB struct {
 	db    *sql.DB
-	cache *ARCCache[string, *QueryResult]
+	cache *ARCCache[uint64, *QueryResult]
 
 	mu      sync.RWMutex // protects enabled flag and tableKeys
 	enabled bool         // whether caching is active
 
 	// tableKeys maps a normalized table name to the set of cache keys
 	// that reference that table. Used for table-level invalidation.
-	tableKeys map[string]map[string]struct{}
+	tableKeys map[string]map[uint64]struct{}
 
 	// keyTables maps a cache key to the set of table names referenced by
 	// the query that produced it. Used to clean up tableKeys on eviction.
-	keyTables map[string]map[string]struct{}
+	keyTables map[uint64]map[string]struct{}
 }
 
 // writeKeywords lists SQL keywords that indicate a write operation.
@@ -64,17 +64,17 @@ func NewCachedDB(db *sql.DB, maxEntries int, maxBytes int64) *CachedDB {
 	cdb := &CachedDB{
 		db:        db,
 		enabled:   true,
-		tableKeys: make(map[string]map[string]struct{}),
-		keyTables: make(map[string]map[string]struct{}),
+		tableKeys: make(map[string]map[uint64]struct{}),
+		keyTables: make(map[uint64]map[string]struct{}),
 	}
 
 	// Build the ARC cache with auto-sizing and an eviction callback to
 	// clean up the table-key index.
-	cdb.cache = NewARCCache[string, *QueryResult](maxEntries, maxBytes,
-		WithSizeFunc[string, *QueryResult](func(_ string, v *QueryResult) int64 {
+	cdb.cache = NewARCCache[uint64, *QueryResult](maxEntries, maxBytes,
+		WithSizeFunc[uint64, *QueryResult](func(_ uint64, v *QueryResult) int64 {
 			return EstimateSize(v)
 		}),
-		WithOnEvict[string, *QueryResult](func(key string, _ *QueryResult) {
+		WithOnEvict[uint64, *QueryResult](func(key uint64, _ *QueryResult) {
 			cdb.removeKeyFromIndex(key)
 		}),
 	)
@@ -103,7 +103,9 @@ func (c *CachedDB) SetEnabled(enabled bool) {
 // For write queries (INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE),
 // the query is executed directly and affected tables are invalidated.
 func (c *CachedDB) Query(ctx context.Context, query string, args ...any) (*QueryResult, error) {
-	if isWriteQuery(query) {
+	// Fast prefix check: if first non-whitespace byte could be a write keyword,
+	// do full tokenization. Otherwise skip SQL parsing entirely.
+	if isWriteQueryFast(query) {
 		result, err := c.executeQuery(ctx, query, args...)
 		if err != nil {
 			return nil, err
@@ -157,13 +159,18 @@ func (c *CachedDB) Invalidate(query string, args ...any) {
 	c.removeKeyFromIndex(key)
 }
 
+// InvalidateByKey removes a specific cached query result by its uint64 cache key.
+func (c *CachedDB) InvalidateByKey(key uint64) {
+	c.cache.Delete(key)
+	c.removeKeyFromIndex(key)
+}
+
 // InvalidateTable invalidates all cached queries that reference the given table.
 func (c *CachedDB) InvalidateTable(table string) {
 	norm := strings.ToUpper(strings.TrimSpace(table))
 	c.mu.Lock()
 	keys := c.tableKeys[norm]
-	// Collect keys before deleting to avoid map mutation during iteration.
-	toDelete := make([]string, 0, len(keys))
+	toDelete := make([]uint64, 0, len(keys))
 	for k := range keys {
 		toDelete = append(toDelete, k)
 	}
@@ -179,8 +186,8 @@ func (c *CachedDB) InvalidateTable(table string) {
 func (c *CachedDB) InvalidateAll() {
 	c.cache.Clear()
 	c.mu.Lock()
-	c.tableKeys = make(map[string]map[string]struct{})
-	c.keyTables = make(map[string]map[string]struct{})
+	c.tableKeys = make(map[string]map[uint64]struct{})
+	c.keyTables = make(map[uint64]map[string]struct{})
 	c.mu.Unlock()
 }
 
@@ -199,8 +206,9 @@ func (c *CachedDB) Close() error {
 
 // indexQueryTables extracts table names from a read query and records
 // the mapping between cache key and table names.
-func (c *CachedDB) indexQueryTables(key, query string) {
-	tables := extractTableNames(query)
+func (c *CachedDB) indexQueryTables(key uint64, query string) {
+	tokens := sqlTokens(query)
+	tables := extractTableNamesFromTokens(tokens)
 	if len(tables) == 0 {
 		return
 	}
@@ -212,7 +220,7 @@ func (c *CachedDB) indexQueryTables(key, query string) {
 	for _, t := range tables {
 		tSet[t] = struct{}{}
 		if c.tableKeys[t] == nil {
-			c.tableKeys[t] = make(map[string]struct{})
+			c.tableKeys[t] = make(map[uint64]struct{})
 		}
 		c.tableKeys[t][key] = struct{}{}
 	}
@@ -220,7 +228,7 @@ func (c *CachedDB) indexQueryTables(key, query string) {
 }
 
 // removeKeyFromIndex removes a cache key from the table-key index.
-func (c *CachedDB) removeKeyFromIndex(key string) {
+func (c *CachedDB) removeKeyFromIndex(key uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -237,10 +245,11 @@ func (c *CachedDB) removeKeyFromIndex(key string) {
 // invalidateForWrite extracts the target table from a write query
 // and invalidates only cache entries that reference that table.
 // Falls back to full cache clear if the table cannot be determined.
+// Tokenizes once and reuses the tokens.
 func (c *CachedDB) invalidateForWrite(query string) {
-	table := extractWriteTable(query)
+	tokens := sqlTokens(query)
+	table := extractWriteTableFromTokens(tokens)
 	if table == "" {
-		// Cannot determine table — safe fallback: clear everything.
 		c.InvalidateAll()
 		return
 	}
@@ -291,19 +300,30 @@ func (c *CachedDB) executeQuery(ctx context.Context, query string, args ...any) 
 
 // --- cache key generation ---
 
+// hasherPool reuses FNV-1a hashers across calls to avoid heap allocation per query.
+var hasherPool = sync.Pool{
+	New: func() any { return fnv.New64a() },
+}
+
 // cacheKey generates a deterministic FNV-1a hash from the query string and arguments.
-func cacheKey(query string, args ...any) string {
-	h := fnv.New64a()
+// Returns a uint64 directly — no string conversion, no allocations beyond the pool.
+func cacheKey(query string, args ...any) uint64 {
+	h := hasherPool.Get().(hash.Hash64)
+	h.Reset()
 	h.Write([]byte(query))
+	var buf [32]byte // stack-allocated scratch buffer for numeric formatting
 	for _, arg := range args {
 		h.Write([]byte{'\x00'})
-		writeTypedArg(h, arg)
+		writeTypedArg(h, arg, buf[:])
 	}
-	return strconv.FormatUint(h.Sum64(), 36)
+	val := h.Sum64()
+	hasherPool.Put(h)
+	return val
 }
 
 // writeTypedArg writes a type-prefixed representation of arg to the hasher.
-func writeTypedArg(h hash.Hash64, arg any) {
+// Uses the caller-provided scratch buffer to avoid heap allocations.
+func writeTypedArg(h hash.Hash64, arg any, buf []byte) {
 	if arg == nil {
 		h.Write([]byte("nil"))
 		return
@@ -314,28 +334,37 @@ func writeTypedArg(h hash.Hash64, arg any) {
 		h.Write([]byte(v))
 	case int:
 		h.Write([]byte("i:"))
-		h.Write(strconv.AppendInt(nil, int64(v), 10))
+		binary.LittleEndian.PutUint64(buf, uint64(v))
+		h.Write(buf[:8])
 	case int64:
 		h.Write([]byte("I:"))
-		h.Write(strconv.AppendInt(nil, v, 10))
+		binary.LittleEndian.PutUint64(buf, uint64(v))
+		h.Write(buf[:8])
 	case int32:
 		h.Write([]byte("i32:"))
-		h.Write(strconv.AppendInt(nil, int64(v), 10))
+		binary.LittleEndian.PutUint32(buf, uint32(v))
+		h.Write(buf[:4])
 	case float64:
 		h.Write([]byte("f:"))
-		h.Write(strconv.AppendFloat(nil, v, 'g', -1, 64))
+		binary.LittleEndian.PutUint64(buf, uint64(v))
+		h.Write(buf[:8])
 	case float32:
 		h.Write([]byte("f32:"))
-		h.Write(strconv.AppendFloat(nil, float64(v), 'g', -1, 32))
+		binary.LittleEndian.PutUint32(buf, uint32(v))
+		h.Write(buf[:4])
 	case bool:
-		h.Write([]byte("b:"))
-		h.Write(strconv.AppendBool(nil, v))
+		if v {
+			h.Write([]byte("b:1"))
+		} else {
+			h.Write([]byte("b:0"))
+		}
 	case []byte:
 		h.Write([]byte("B:"))
 		h.Write(v)
 	case time.Time:
 		h.Write([]byte("t:"))
-		h.Write(strconv.AppendInt(nil, v.UnixNano(), 10))
+		binary.LittleEndian.PutUint64(buf, uint64(v.UnixNano()))
+		h.Write(buf[:8])
 	default:
 		fmt.Fprintf(h, "%T:%v", arg, arg)
 	}
@@ -343,23 +372,63 @@ func writeTypedArg(h hash.Hash64, arg any) {
 
 // --- SQL parsing helpers ---
 
-// isWriteQuery detects whether a SQL query is a write operation.
-// Handles CTEs (WITH ... INSERT/UPDATE/DELETE), procedures (CALL),
-// and standard DML/DDL statements.
+// isWriteQueryFast uses a cheap prefix check to skip full SQL parsing for
+// the most common case (SELECT / SHOW / EXPLAIN). Only falls back to
+// full tokenization for ambiguous prefixes like WITH (CTE + possible DML).
+func isWriteQueryFast(query string) bool {
+	// Skip leading whitespace.
+	s := query
+	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t' || s[0] == '\n' || s[0] == '\r') {
+		s = s[1:]
+	}
+	if len(s) == 0 {
+		return false
+	}
+	// Lowercase the first character for comparison.
+	ch := s[0] | 0x20
+	switch ch {
+	case 's': // SELECT, SHOW, SET — always reads
+		return false
+	case 'e': // EXPLAIN — always a read
+		return false
+	case 'd': // DESCRIBE — read; DELETE, DROP — write
+		// Check for DESCRIBE vs DELETE/DROP
+		if len(s) >= 2 && (s[1]|0x20) == 'e' {
+			if len(s) >= 3 && (s[2]|0x20) == 's' { // DES... → DESCRIBE
+				return false
+			}
+			return true // DELETE
+		}
+		return true // DROP or other D-word
+	case 'w': // WITH — ambiguous (CTE could wrap a write)
+		return isWriteQuery(query)
+	default:
+		// i=INSERT, u=UPDATE/UPSERT, c=CREATE/CALL, a=ALTER,
+		// t=TRUNCATE, r=REPLACE/REVOKE, m=MERGE, g=GRANT
+		// All are writes. Unknown prefixes → check fully.
+		return isWriteQuery(query)
+	}
+}
+
+// isWriteQuery does full SQL tokenization to detect write operations.
+// Called only when the fast prefix check is ambiguous.
 func isWriteQuery(query string) bool {
 	tokens := sqlTokens(query)
+	return isWriteFromTokens(tokens)
+}
+
+// isWriteFromTokens checks pre-tokenized SQL for write keywords.
+func isWriteFromTokens(tokens []string) bool {
 	if len(tokens) == 0 {
 		return false
 	}
 
 	first := tokens[0]
 
-	// Fast path: first token is a known write keyword.
 	if writeKeywords[first] {
 		return true
 	}
 
-	// Handle WITH ... <DML> (CTEs wrapping writes).
 	if first == "WITH" {
 		for _, tok := range tokens[1:] {
 			if writeKeywords[tok] {
@@ -375,6 +444,11 @@ func isWriteQuery(query string) bool {
 // Returns "" if the table cannot be determined.
 func extractWriteTable(query string) string {
 	tokens := sqlTokens(query)
+	return extractWriteTableFromTokens(tokens)
+}
+
+// extractWriteTableFromTokens extracts the target table from pre-tokenized SQL.
+func extractWriteTableFromTokens(tokens []string) string {
 	if len(tokens) == 0 {
 		return ""
 	}
@@ -464,16 +538,20 @@ func extractWriteTable(query string) string {
 }
 
 // extractTableNames extracts table names referenced in a read query.
-// It looks for FROM and JOIN keywords followed by a table name.
 func extractTableNames(query string) []string {
 	tokens := sqlTokens(query)
+	return extractTableNamesFromTokens(tokens)
+}
+
+// extractTableNamesFromTokens extracts table names from pre-tokenized SQL.
+// It looks for FROM and JOIN keywords followed by a table name.
+func extractTableNamesFromTokens(tokens []string) []string {
 	seen := make(map[string]bool)
 	var tables []string
 
 	for i, tok := range tokens {
 		if (tok == "FROM" || tok == "JOIN") && i+1 < len(tokens) {
 			next := tokens[i+1]
-			// Skip sub-selects: (SELECT ...
 			if next == "(" || next == "SELECT" {
 				continue
 			}
@@ -487,20 +565,37 @@ func extractTableNames(query string) []string {
 	return tables
 }
 
+// sqlSepReplacer replaces common SQL separators with spaces.
+// Hoisted to package level to avoid allocating a new Replacer per call.
+var sqlSepReplacer = strings.NewReplacer("(", " ", ")", " ", ",", " ", ";", " ", "\t", " ", "\r", " ")
+
 // sqlTokens splits a SQL string into uppercase tokens, stripping
 // comments, parentheses, commas, and semicolons.
 func sqlTokens(query string) []string {
 	s := strings.TrimSpace(query)
 	s = strings.ToUpper(s)
 	// Remove single-line comments
-	var lines []string
-	for _, line := range strings.Split(s, "\n") {
-		if idx := strings.Index(line, "--"); idx >= 0 {
-			line = line[:idx]
+	if strings.Contains(s, "--") {
+		var b strings.Builder
+		b.Grow(len(s))
+		for len(s) > 0 {
+			nl := strings.IndexByte(s, '\n')
+			var line string
+			if nl < 0 {
+				line = s
+				s = ""
+			} else {
+				line = s[:nl]
+				s = s[nl+1:]
+			}
+			if idx := strings.Index(line, "--"); idx >= 0 {
+				line = line[:idx]
+			}
+			b.WriteString(line)
+			b.WriteByte(' ')
 		}
-		lines = append(lines, line)
+		s = b.String()
 	}
-	s = strings.Join(lines, " ")
 	// Remove block comments (simple non-nested)
 	for {
 		start := strings.Index(s, "/*")
@@ -514,9 +609,7 @@ func sqlTokens(query string) []string {
 		}
 		s = s[:start] + " " + s[start+end+2:]
 	}
-	// Replace common separators with spaces
-	r := strings.NewReplacer("(", " ", ")", " ", ",", " ", ";", " ", "\t", " ", "\r", " ")
-	s = r.Replace(s)
+	s = sqlSepReplacer.Replace(s)
 	return strings.Fields(s)
 }
 
